@@ -1,76 +1,107 @@
 """
-GitHub PR Agent using Anthropic SDK and MCP GitHub Server
+GitHub PR Agent using LangChain with configurable model support
 """
 import os
+import json
 import asyncio
 from typing import List, Dict, Any, Optional
-from anthropic import Anthropic
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+# Short aliases → full model IDs
+MODEL_ALIASES = {
+    "claude-sonnet": "claude-sonnet-4-6",
+    "claude-haiku": "claude-haiku-4-5-20251001",
+    "claude-opus": "claude-opus-4-6",
+}
+
+
+def resolve_model(model: str) -> str:
+    """Resolve a model alias to its full model ID."""
+    return MODEL_ALIASES.get(model, model)
 
 
 class GitHubPRAgent:
     """Agent that creates GitHub PRs based on error descriptions"""
 
-    def __init__(self, github_token: str, anthropic_api_key: str):
+    def __init__(
+        self,
+        github_token: str,
+        model: str = "claude-sonnet-4-6",
+        anthropic_api_key: Optional[str] = None,
+        openai_api_key: Optional[str] = None,
+    ):
         """
-        Initialize the agent
+        Initialize the agent.
 
         Args:
             github_token: GitHub personal access token
-            anthropic_api_key: Anthropic API key
+            model: LangChain-compatible model name (e.g. "claude-sonnet-4-6", "gpt-4o-mini")
+            anthropic_api_key: Anthropic API key (falls back to ANTHROPIC_API_KEY env var)
+            openai_api_key: OpenAI API key (falls back to OPENAI_API_KEY env var)
         """
         self.github_token = github_token
-        self.anthropic = Anthropic(api_key=anthropic_api_key)
+        self.model_name = resolve_model(model)
+
+        if anthropic_api_key:
+            os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
+        if openai_api_key:
+            os.environ["OPENAI_API_KEY"] = openai_api_key
+
+        self.llm = init_chat_model(self.model_name)
         self.mcp_session: Optional[ClientSession] = None
         self.stdio_transport = None
         self.available_tools: List[Dict[str, Any]] = []
+        self.llm_with_tools = None
 
     async def connect_mcp(self):
-        """Connect to MCP GitHub server and discover available tools"""
+        """Connect to MCP GitHub server and discover available tools."""
         print("🔌 Connecting to MCP GitHub server...")
 
         server_params = StdioServerParameters(
             command="npx",
             args=["-y", "@modelcontextprotocol/server-github"],
-            env={
-                **os.environ,
-                "GITHUB_PERSONAL_ACCESS_TOKEN": self.github_token
-            }
+            env={**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": self.github_token},
         )
 
-        # Start MCP client
         self.stdio_transport = await stdio_client(server_params)
         self.mcp_session = self.stdio_transport[1]
 
-        # Get available tools from MCP server
         tools_response = await self.mcp_session.list_tools()
         self.available_tools = [
             {
                 "name": tool.name,
                 "description": tool.description,
-                "input_schema": tool.inputSchema
+                "input_schema": tool.inputSchema,
             }
             for tool in tools_response.tools
         ]
 
-        tool_names = [t['name'] for t in self.available_tools]
+        self.llm_with_tools = self.llm.bind_tools(self._as_langchain_tools())
+
+        tool_names = [t["name"] for t in self.available_tools]
         print(f"✅ Connected! Available tools: {', '.join(tool_names)}")
 
+    def _as_langchain_tools(self) -> List[Dict]:
+        """Convert MCP tool definitions to LangChain-compatible format."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["input_schema"],
+                },
+            }
+            for tool in self.available_tools
+        ]
+
     async def execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
-        """
-        Execute a tool via MCP
-
-        Args:
-            tool_name: Name of the tool to execute
-            tool_input: Input parameters for the tool
-
-        Returns:
-            Tool execution result as string
-        """
+        """Execute a tool via MCP."""
         if not self.mcp_session:
             raise RuntimeError("MCP session not connected. Call connect_mcp() first.")
-
         result = await self.mcp_session.call_tool(tool_name, tool_input)
         return result.content[0].text if result.content else ""
 
@@ -79,10 +110,10 @@ class GitHubPRAgent:
         error_description: str,
         repo: str,
         base_branch: str = "main",
-        labels: Optional[List[str]] = None
+        labels: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        Main agent loop to create PR from error description
+        Main agent loop to create a PR from an error description.
 
         Args:
             error_description: Description of the error/exception
@@ -93,7 +124,7 @@ class GitHubPRAgent:
         Returns:
             Dictionary with PR details or error information
         """
-        print(f"\n🤖 Starting PR creation agent for {repo}...")
+        print(f"\n🤖 Starting PR creation agent for {repo} [{self.model_name}]...")
         print(f"📝 Error: {error_description[:100]}...")
 
         system_prompt = """You are a GitHub automation agent. Your job is to:
@@ -127,97 +158,57 @@ Base Branch: {base_branch}
 Please create a draft PR to track and address this issue.
 """
 
-        messages = [{"role": "user", "content": user_message}]
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_message),
+        ]
         pr_url = None
-
-        # Agent loop
-        iteration = 0
         max_iterations = 10
 
-        while iteration < max_iterations:
-            iteration += 1
+        for iteration in range(1, max_iterations + 1):
             print(f"\n🔄 Agent iteration {iteration}...")
 
-            response = self.anthropic.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                system=system_prompt,
-                tools=self.available_tools,
-                messages=messages
-            )
+            response: AIMessage = await self.llm_with_tools.ainvoke(messages)
+            messages.append(response)
 
-            # Add assistant response to messages
-            messages.append({
-                "role": "assistant",
-                "content": response.content
-            })
-
-            # Check if we're done
-            if response.stop_reason == "end_turn":
-                # Extract final text response
-                final_text = ""
-                for block in response.content:
-                    if hasattr(block, 'text'):
-                        final_text += block.text
-
-                print(f"\n✅ Agent completed!")
+            if not response.tool_calls:
+                final_text = response.content if isinstance(response.content, str) else str(response.content)
+                print("\n✅ Agent completed!")
                 return {
                     "status": "success",
                     "message": final_text,
                     "pr_url": pr_url,
-                    "iterations": iteration
+                    "iterations": iteration,
+                    "model": self.model_name,
                 }
 
-            # Execute tool calls
-            if response.stop_reason == "tool_use":
-                tool_results = []
+            for tool_call in response.tool_calls:
+                name = tool_call["name"]
+                args = tool_call["args"]
+                print(f"  🔧 Executing tool: {name}")
+                print(f"     Input: {args}")
 
-                for block in response.content:
-                    if block.type == "tool_use":
-                        print(f"  🔧 Executing tool: {block.name}")
-                        print(f"     Input: {block.input}")
+                try:
+                    result = await self.execute_tool(name, args)
+                    print("     ✓ Success")
 
-                        try:
-                            # Execute via MCP
-                            result = await self.execute_tool(block.name, block.input)
-                            print(f"     ✓ Success")
+                    if "pull_request" in name and "html_url" in result:
+                        result_data = json.loads(result)
+                        pr_url = result_data.get("html_url") or result_data.get("url")
 
-                            # Try to extract PR URL from result
-                            if "pull_request" in block.name and "html_url" in result:
-                                import json
-                                result_data = json.loads(result)
-                                pr_url = result_data.get("html_url") or result_data.get("url")
-
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": result
-                            })
-                        except Exception as e:
-                            print(f"     ✗ Error: {str(e)}")
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": f"Error executing tool: {str(e)}",
-                                "is_error": True
-                            })
-
-                # Add tool results to messages
-                messages.append({
-                    "role": "user",
-                    "content": tool_results
-                })
-            else:
-                break
+                    messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
+                except Exception as e:
+                    print(f"     ✗ Error: {e}")
+                    messages.append(ToolMessage(content=f"Error: {str(e)}", tool_call_id=tool_call["id"]))
 
         return {
             "status": "error",
             "message": "Max iterations reached",
-            "iterations": iteration
+            "iterations": max_iterations,
         }
 
     async def cleanup(self):
-        """Clean up MCP connection"""
+        """Clean up MCP connection."""
         if self.stdio_transport:
             print("🔌 Disconnecting from MCP server...")
             await self.stdio_transport[0].__aexit__(None, None, None)
@@ -229,9 +220,11 @@ async def main():
     from dotenv import load_dotenv
     load_dotenv()
 
+    model = os.getenv("MODEL", "claude-sonnet-4-6")
+
     agent = GitHubPRAgent(
         github_token=os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"),
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")
+        model=model,
     )
 
     try:
@@ -253,10 +246,10 @@ async def main():
             null case explicit and force calling code to handle it properly.
             """,
             repo="owner/repo",  # Replace with actual repo
-            base_branch="main"
+            base_branch="main",
         )
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("RESULT:")
         print(result)
 

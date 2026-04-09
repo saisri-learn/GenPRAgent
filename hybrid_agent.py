@@ -1,48 +1,68 @@
 """
-Hybrid Multi-LLM Agent for GitHub PR Generation
-Supports: GPT-4o mini (testing/simple), Claude Sonnet (complex)
+Hybrid Multi-LLM Agent for GitHub PR Generation using LangChain
+Model is fully configurable; complexity analysis selects model in auto mode.
 """
 import os
-import asyncio
 import json
+import asyncio
 from typing import List, Dict, Any, Optional, Literal
-from anthropic import Anthropic
-from openai import OpenAI
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# Short aliases → full model IDs
+MODEL_ALIASES = {
+    "claude-sonnet": "claude-sonnet-4-6",
+    "claude-haiku": "claude-haiku-4-5-20251001",
+    "claude-opus": "claude-opus-4-6",
+}
 
-LLMProvider = Literal["gpt-4o-mini", "gpt-4o", "claude-sonnet", "claude-haiku", "auto"]
+# Approximate cost per token for cost tracking
+COST_PER_TOKEN: Dict[str, Dict[str, float]] = {
+    "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
+    "gpt-4o": {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
+    "claude-sonnet-4-6": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
+    "claude-haiku-4-5-20251001": {"input": 0.80 / 1_000_000, "output": 4.00 / 1_000_000},
+    "claude-opus-4-6": {"input": 15.00 / 1_000_000, "output": 75.00 / 1_000_000},
+}
+
+
+def resolve_model(model: str) -> str:
+    """Resolve a model alias to its full model ID."""
+    return MODEL_ALIASES.get(model, model)
 
 
 class HybridPRAgent:
     """
-    Hybrid agent that can use multiple LLMs intelligently
-    - GPT-4o mini: Fast, cheap, good for testing and simple errors
-    - Claude Sonnet: Best quality, for complex errors
-    - Auto mode: Analyzes complexity and chooses best LLM
+    Hybrid agent that can use multiple LLMs via LangChain.
+    All providers share the same agent loop — only the model name differs.
+    Auto mode analyzes complexity to select the optimal model.
     """
 
     def __init__(
         self,
-        openai_api_key: Optional[str] = None,
+        github_token: str,
+        default_model: str = "gpt-4o-mini",
         anthropic_api_key: Optional[str] = None,
-        github_token: Optional[str] = None,
-        default_llm: LLMProvider = "gpt-4o-mini"
+        openai_api_key: Optional[str] = None,
     ):
         """
-        Initialize hybrid agent
+        Initialize hybrid agent.
 
         Args:
-            openai_api_key: OpenAI API key (for GPT models)
-            anthropic_api_key: Anthropic API key (for Claude models)
             github_token: GitHub personal access token
-            default_llm: Default LLM to use
+            default_model: Default model to use (e.g. "gpt-4o-mini", "claude-sonnet-4-6", "auto")
+            anthropic_api_key: Anthropic API key (falls back to ANTHROPIC_API_KEY env var)
+            openai_api_key: OpenAI API key (falls back to OPENAI_API_KEY env var)
         """
-        self.openai = OpenAI(api_key=openai_api_key) if openai_api_key else None
-        self.anthropic = Anthropic(api_key=anthropic_api_key) if anthropic_api_key else None
         self.github_token = github_token
-        self.default_llm = default_llm
+        self.default_model = resolve_model(default_model)
+
+        if anthropic_api_key:
+            os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
+        if openai_api_key:
+            os.environ["OPENAI_API_KEY"] = openai_api_key
 
         self.mcp_session: Optional[ClientSession] = None
         self.stdio_transport = None
@@ -50,217 +70,122 @@ class HybridPRAgent:
 
         # Cost tracking
         self.total_cost = 0.0
-        self.llm_usage = {}
+        self.model_usage: Dict[str, int] = {}
 
     async def connect_mcp(self):
-        """Connect to MCP GitHub server"""
+        """Connect to MCP GitHub server."""
         print("🔌 Connecting to MCP GitHub server...")
 
         server_params = StdioServerParameters(
             command="npx",
             args=["-y", "@modelcontextprotocol/server-github"],
-            env={
-                **os.environ,
-                "GITHUB_PERSONAL_ACCESS_TOKEN": self.github_token
-            }
+            env={**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": self.github_token},
         )
 
         self.stdio_transport = await stdio_client(server_params)
         self.mcp_session = self.stdio_transport[1]
 
-        # Get available tools
         tools_response = await self.mcp_session.list_tools()
         self.available_tools = [
             {
                 "name": tool.name,
                 "description": tool.description,
-                "input_schema": tool.inputSchema
+                "input_schema": tool.inputSchema,
             }
             for tool in tools_response.tools
         ]
 
-        tool_names = [t['name'] for t in self.available_tools]
+        tool_names = [t["name"] for t in self.available_tools]
         print(f"✅ Connected! Available tools: {', '.join(tool_names)}")
 
+    def _as_langchain_tools(self) -> List[Dict]:
+        """Convert MCP tool definitions to LangChain-compatible format."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["input_schema"],
+                },
+            }
+            for tool in self.available_tools
+        ]
+
     async def execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
-        """Execute tool via MCP"""
+        """Execute a tool via MCP."""
         if not self.mcp_session:
             raise RuntimeError("MCP session not connected")
-
         result = await self.mcp_session.call_tool(tool_name, tool_input)
         return result.content[0].text if result.content else ""
 
     def _analyze_complexity(self, error_description: str) -> Literal["simple", "complex"]:
         """
-        Analyze error complexity to choose appropriate LLM
+        Analyze error complexity to choose appropriate model.
 
-        Simple: Single error, clear stack trace, common issue
-        Complex: Multiple errors, unclear root cause, architectural issue
+        Simple: single error, clear stack trace, common issue type
+        Complex: multiple errors, architectural issues, security concerns
         """
         description_lower = error_description.lower()
 
-        # Indicators of complexity
         complex_indicators = [
             "architecture", "design", "refactor", "migrate",
             "multiple", "concurrent", "race condition", "deadlock",
             "performance", "scale", "optimize", "memory leak",
             "security", "vulnerability", "injection",
-            len(error_description) > 1000,  # Long descriptions
-            error_description.count("\n") > 30,  # Many lines
+            len(error_description) > 1000,
+            error_description.count("\n") > 30,
         ]
 
         simple_indicators = [
             "nullpointer", "undefined", "typeerror",
             "syntax error", "import error", "not found",
-            "missing", "typo"
+            "missing", "typo",
         ]
 
-        complexity_score = 0
-
+        score = 0
         for indicator in complex_indicators:
             if isinstance(indicator, bool):
-                if indicator:
-                    complexity_score += 1
+                score += 1 if indicator else 0
             elif indicator in description_lower:
-                complexity_score += 1
+                score += 1
 
         for indicator in simple_indicators:
             if indicator in description_lower:
-                complexity_score -= 1
+                score -= 1
 
-        return "complex" if complexity_score > 1 else "simple"
-
-    def _convert_tools_to_openai_format(self) -> List[Dict]:
-        """Convert MCP tools to OpenAI function format"""
-        openai_tools = []
-        for tool in self.available_tools:
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["input_schema"]
-                }
-            })
-        return openai_tools
-
-    def _estimate_cost(self, llm: str, input_tokens: int, output_tokens: int) -> float:
-        """Estimate cost based on token usage"""
-        pricing = {
-            "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
-            "gpt-4o": {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
-            "claude-sonnet": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
-            "claude-haiku": {"input": 0.80 / 1_000_000, "output": 4.00 / 1_000_000},
-        }
-
-        if llm not in pricing:
-            return 0.0
-
-        cost = (input_tokens * pricing[llm]["input"]) + (output_tokens * pricing[llm]["output"])
-        return cost
-
-    async def _call_gpt(
-        self,
-        messages: List[Dict],
-        system_prompt: str,
-        model: str = "gpt-4o-mini"
-    ) -> Dict[str, Any]:
-        """Call OpenAI GPT model"""
-        if not self.openai:
-            raise RuntimeError("OpenAI API key not configured")
-
-        # Add system message
-        full_messages = [{"role": "system", "content": system_prompt}] + messages
-
-        response = self.openai.chat.completions.create(
-            model=model,
-            messages=full_messages,
-            tools=self._convert_tools_to_openai_format(),
-            tool_choice="auto"
-        )
-
-        # Track usage
-        usage = response.usage
-        cost = self._estimate_cost(model, usage.prompt_tokens, usage.completion_tokens)
-        self.total_cost += cost
-        self.llm_usage[model] = self.llm_usage.get(model, 0) + 1
-
-        return {
-            "content": response.choices[0].message,
-            "stop_reason": "tool_calls" if response.choices[0].message.tool_calls else "end_turn",
-            "usage": {
-                "input_tokens": usage.prompt_tokens,
-                "output_tokens": usage.completion_tokens,
-                "cost": cost
-            }
-        }
-
-    async def _call_claude(
-        self,
-        messages: List[Dict],
-        system_prompt: str,
-        model: str = "claude-sonnet-4-6"
-    ) -> Dict[str, Any]:
-        """Call Anthropic Claude model"""
-        if not self.anthropic:
-            raise RuntimeError("Anthropic API key not configured")
-
-        response = self.anthropic.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=system_prompt,
-            tools=self.available_tools,
-            messages=messages
-        )
-
-        # Track usage
-        usage = response.usage
-        llm_name = "claude-sonnet" if "sonnet" in model else "claude-haiku"
-        cost = self._estimate_cost(llm_name, usage.input_tokens, usage.output_tokens)
-        self.total_cost += cost
-        self.llm_usage[llm_name] = self.llm_usage.get(llm_name, 0) + 1
-
-        return {
-            "content": response.content,
-            "stop_reason": response.stop_reason,
-            "usage": {
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cost": cost
-            }
-        }
+        return "complex" if score > 1 else "simple"
 
     async def create_pr_from_error(
         self,
         error_description: str,
         repo: str,
         base_branch: str = "main",
-        llm: LLMProvider = None
+        model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Create PR using hybrid LLM approach
+        Create a PR using the configured model (or auto-select based on complexity).
 
         Args:
             error_description: Error/exception description
             repo: Repository (owner/repo)
             base_branch: Base branch
-            llm: LLM to use (None = use default)
+            model: Override model for this call (None = use default_model)
 
         Returns:
             Result dict with PR details and cost info
         """
-        # Determine which LLM to use
-        if llm is None:
-            llm = self.default_llm
+        resolved = resolve_model(model) if model else self.default_model
 
-        if llm == "auto":
+        if resolved == "auto":
             complexity = self._analyze_complexity(error_description)
-            llm = "claude-sonnet" if complexity == "complex" else "gpt-4o-mini"
-            print(f"🤖 Auto-detected complexity: {complexity}")
-            print(f"📊 Selecting LLM: {llm}")
+            resolved = "claude-sonnet-4-6" if complexity == "complex" else "gpt-4o-mini"
+            print(f"🤖 Auto-detected complexity: {complexity} → {resolved}")
 
-        print(f"\n🚀 Starting PR creation with {llm.upper()}...")
+        print(f"\n🚀 Starting PR creation with {resolved}...")
         print(f"📝 Error: {error_description[:100]}...")
+
+        llm = init_chat_model(resolved).bind_tools(self._as_langchain_tools())
 
         system_prompt = """You are a GitHub automation agent. Your task:
 
@@ -286,168 +211,83 @@ Base Branch: {base_branch}
 Please create a draft PR to track and address this issue.
 """
 
-        # Initialize conversation
-        if llm.startswith("gpt"):
-            messages = [{"role": "user", "content": user_message}]
-        else:
-            messages = [{"role": "user", "content": user_message}]
-
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_message),
+        ]
         pr_url = None
-        iteration = 0
         max_iterations = 10
 
-        # Agent loop
-        while iteration < max_iterations:
-            iteration += 1
-            print(f"\n🔄 Iteration {iteration} [{llm}]...")
+        for iteration in range(1, max_iterations + 1):
+            print(f"\n🔄 Iteration {iteration} [{resolved}]...")
 
-            # Call appropriate LLM
-            if llm.startswith("gpt"):
-                response = await self._call_gpt(messages, system_prompt, model=llm)
-                msg_content = response["content"]
+            response: AIMessage = await llm.ainvoke(messages)
+            messages.append(response)
 
-                # Handle GPT response
-                if msg_content.tool_calls:
-                    # Add assistant message
-                    messages.append({
-                        "role": "assistant",
-                        "content": msg_content.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments
-                                }
-                            }
-                            for tc in msg_content.tool_calls
-                        ]
-                    })
+            # Track token usage and cost if available
+            if response.usage_metadata:
+                input_tokens = response.usage_metadata.get("input_tokens", 0)
+                output_tokens = response.usage_metadata.get("output_tokens", 0)
+                pricing = COST_PER_TOKEN.get(resolved, {})
+                cost = (
+                    input_tokens * pricing.get("input", 0)
+                    + output_tokens * pricing.get("output", 0)
+                )
+                self.total_cost += cost
+                self.model_usage[resolved] = self.model_usage.get(resolved, 0) + 1
 
-                    # Execute tools
-                    for tool_call in msg_content.tool_calls:
-                        print(f"  🔧 {tool_call.function.name}")
+            if not response.tool_calls:
+                final_text = response.content if isinstance(response.content, str) else str(response.content)
+                print("\n✅ Agent completed!")
+                return {
+                    "status": "success",
+                    "message": final_text,
+                    "pr_url": pr_url,
+                    "model_used": resolved,
+                    "iterations": iteration,
+                    "total_cost": self.total_cost,
+                    "cost_usd": f"${self.total_cost:.6f}",
+                }
 
-                        try:
-                            args = json.loads(tool_call.function.arguments)
-                            result = await self.execute_tool(tool_call.function.name, args)
-                            print(f"     ✓ Success")
+            for tool_call in response.tool_calls:
+                name = tool_call["name"]
+                args = tool_call["args"]
+                print(f"  🔧 {name}")
 
-                            # Track PR URL
-                            if "pull_request" in tool_call.function.name and "html_url" in result:
-                                result_data = json.loads(result)
-                                pr_url = result_data.get("html_url") or result_data.get("url")
+                try:
+                    result = await self.execute_tool(name, args)
+                    print("     ✓ Success")
 
-                            # Add tool result
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": result
-                            })
-                        except Exception as e:
-                            print(f"     ✗ Error: {e}")
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": f"Error: {str(e)}"
-                            })
-                else:
-                    # Done
-                    final_text = msg_content.content or "Completed"
-                    print(f"\n✅ Agent completed!")
-                    return {
-                        "status": "success",
-                        "message": final_text,
-                        "pr_url": pr_url,
-                        "llm_used": llm,
-                        "iterations": iteration,
-                        "total_cost": self.total_cost,
-                        "cost_usd": f"${self.total_cost:.6f}"
-                    }
+                    if "pull_request" in name and "html_url" in result:
+                        result_data = json.loads(result)
+                        pr_url = result_data.get("html_url") or result_data.get("url")
 
-            else:  # Claude
-                response = await self._call_claude(messages, system_prompt, model=llm)
-
-                # Add assistant message
-                messages.append({
-                    "role": "assistant",
-                    "content": response["content"]
-                })
-
-                if response["stop_reason"] == "end_turn":
-                    final_text = ""
-                    for block in response["content"]:
-                        if hasattr(block, 'text'):
-                            final_text += block.text
-
-                    print(f"\n✅ Agent completed!")
-                    return {
-                        "status": "success",
-                        "message": final_text,
-                        "pr_url": pr_url,
-                        "llm_used": llm,
-                        "iterations": iteration,
-                        "total_cost": self.total_cost,
-                        "cost_usd": f"${self.total_cost:.6f}"
-                    }
-
-                # Execute tool calls
-                if response["stop_reason"] == "tool_use":
-                    tool_results = []
-
-                    for block in response["content"]:
-                        if block.type == "tool_use":
-                            print(f"  🔧 {block.name}")
-
-                            try:
-                                result = await self.execute_tool(block.name, block.input)
-                                print(f"     ✓ Success")
-
-                                # Track PR URL
-                                if "pull_request" in block.name and "html_url" in result:
-                                    result_data = json.loads(result)
-                                    pr_url = result_data.get("html_url") or result_data.get("url")
-
-                                tool_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": result
-                                })
-                            except Exception as e:
-                                print(f"     ✗ Error: {e}")
-                                tool_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": f"Error: {str(e)}",
-                                    "is_error": True
-                                })
-
-                    messages.append({
-                        "role": "user",
-                        "content": tool_results
-                    })
+                    messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
+                except Exception as e:
+                    print(f"     ✗ Error: {e}")
+                    messages.append(ToolMessage(content=f"Error: {str(e)}", tool_call_id=tool_call["id"]))
 
         return {
             "status": "error",
             "message": "Max iterations reached",
-            "iterations": iteration,
-            "total_cost": self.total_cost
+            "iterations": max_iterations,
+            "total_cost": self.total_cost,
         }
 
     async def cleanup(self):
-        """Clean up MCP connection"""
+        """Clean up MCP connection."""
         if self.stdio_transport:
             print("🔌 Disconnecting from MCP server...")
             await self.stdio_transport[0].__aexit__(None, None, None)
             print("✅ Disconnected")
 
     def get_cost_summary(self) -> Dict[str, Any]:
-        """Get cost summary"""
+        """Get cost summary for this session."""
+        total_calls = max(sum(self.model_usage.values()), 1)
         return {
             "total_cost_usd": f"${self.total_cost:.6f}",
-            "llm_usage": self.llm_usage,
-            "average_cost_per_call": f"${self.total_cost / max(sum(self.llm_usage.values()), 1):.6f}"
+            "model_usage": self.model_usage,
+            "average_cost_per_call": f"${self.total_cost / total_calls:.6f}",
         }
 
 
@@ -456,37 +296,34 @@ async def main():
     from dotenv import load_dotenv
     load_dotenv()
 
-    print("="*60)
-    print("Hybrid Multi-LLM PR Agent")
-    print("="*60)
+    print("=" * 60)
+    print("Hybrid Multi-LLM PR Agent (LangChain)")
+    print("=" * 60)
 
-    print("\nSelect LLM:")
-    print("1. GPT-4o mini (fast, cheap - $0.001/PR)")
-    print("2. Claude Sonnet (best quality - $0.03/PR)")
-    print("3. Auto (analyzes complexity)")
+    print("\nSelect model:")
+    print("1. gpt-4o-mini (fast, cheap - ~$0.001/PR)")
+    print("2. claude-sonnet-4-6 (best quality - ~$0.03/PR)")
+    print("3. auto (analyzes complexity and selects model)")
 
     choice = input("\nChoice (1-3): ").strip()
 
-    llm_map = {
+    model_map = {
         "1": "gpt-4o-mini",
-        "2": "claude-sonnet",
-        "3": "auto"
+        "2": "claude-sonnet-4-6",
+        "3": "auto",
     }
 
-    selected_llm = llm_map.get(choice, "gpt-4o-mini")
+    selected_model = model_map.get(choice, "gpt-4o-mini")
 
     agent = HybridPRAgent(
-        openai_api_key=os.getenv("OPENAI_API_KEY"),
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
         github_token=os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"),
-        default_llm=selected_llm
+        default_model=selected_model,
     )
 
     try:
         await agent.connect_mcp()
 
         repo = input("\nEnter repository (owner/repo): ").strip()
-
         if not repo or "/" not in repo:
             print("❌ Invalid repository format")
             return
@@ -503,24 +340,23 @@ async def main():
             Issue: getUserById() returns null when user not found.
             Solution: Return Optional<User> instead of User.
             """,
-            repo=repo
+            repo=repo,
         )
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("RESULT:")
-        print("="*60)
-        print(f"Status: {result['status']}")
-        print(f"LLM Used: {result.get('llm_used', 'N/A')}")
-        print(f"Cost: {result.get('cost_usd', 'N/A')}")
-        print(f"PR URL: {result.get('pr_url', 'N/A')}")
-        print(f"Message: {result['message'][:200]}...")
-        print("="*60)
+        print("=" * 60)
+        print(f"Status:    {result['status']}")
+        print(f"Model:     {result.get('model_used', 'N/A')}")
+        print(f"Cost:      {result.get('cost_usd', 'N/A')}")
+        print(f"PR URL:    {result.get('pr_url', 'N/A')}")
+        print(f"Message:   {str(result['message'])[:200]}...")
+        print("=" * 60)
 
-        # Show cost summary
         cost_summary = agent.get_cost_summary()
         print("\n💰 Cost Summary:")
-        print(f"Total Cost: {cost_summary['total_cost_usd']}")
-        print(f"LLM Usage: {cost_summary['llm_usage']}")
+        print(f"  Total:    {cost_summary['total_cost_usd']}")
+        print(f"  Usage:    {cost_summary['model_usage']}")
 
     finally:
         await agent.cleanup()

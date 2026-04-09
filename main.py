@@ -10,10 +10,13 @@ from dotenv import load_dotenv
 import asyncio
 from contextlib import asynccontextmanager
 
-from agent import GitHubPRAgent
+from agent import GitHubPRAgent, resolve_model
 
 # Load environment variables
 load_dotenv()
+
+# Default model — configurable via MODEL env var
+DEFAULT_MODEL = os.getenv("MODEL", "claude-sonnet-4-6")
 
 # Lifespan context manager for startup/shutdown
 @asynccontextmanager
@@ -50,6 +53,10 @@ class ErrorRequest(BaseModel):
         default=None,
         description="Optional labels to add to the PR"
     )
+    model: str = Field(
+        default=DEFAULT_MODEL,
+        description="LangChain model name to use (e.g. 'claude-sonnet-4-6', 'gpt-4o-mini')"
+    )
 
 
 class ErrorResponse(BaseModel):
@@ -58,6 +65,7 @@ class ErrorResponse(BaseModel):
     message: str
     pr_url: Optional[str] = None
     iterations: Optional[int] = None
+    model: Optional[str] = None
 
 
 @app.get("/")
@@ -74,12 +82,13 @@ async def root():
 async def health():
     """Health check endpoint"""
     github_token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 
     return {
         "status": "healthy",
         "github_configured": bool(github_token),
-        "anthropic_configured": bool(anthropic_key)
+        "anthropic_configured": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "default_model": DEFAULT_MODEL,
     }
 
 
@@ -96,7 +105,6 @@ async def create_pr_endpoint(request: ErrorRequest):
     Returns the PR URL and details
     """
     github_token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 
     if not github_token:
         raise HTTPException(
@@ -104,15 +112,9 @@ async def create_pr_endpoint(request: ErrorRequest):
             detail="GITHUB_PERSONAL_ACCESS_TOKEN not configured"
         )
 
-    if not anthropic_key:
-        raise HTTPException(
-            status_code=500,
-            detail="ANTHROPIC_API_KEY not configured"
-        )
-
     agent = GitHubPRAgent(
         github_token=github_token,
-        anthropic_api_key=anthropic_key
+        model=resolve_model(request.model),
     )
 
     try:
@@ -147,7 +149,7 @@ async def create_pr_async_endpoint(request: ErrorRequest, background_tasks: Back
     async def create_pr_task():
         agent = GitHubPRAgent(
             github_token=os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"),
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")
+            model=resolve_model(request.model),
         )
         try:
             await agent.connect_mcp()

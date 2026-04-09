@@ -1,0 +1,32 @@
+# AWS Lambda Container Image for GenPRAgent
+# Uses AWS Lambda Python base image
+
+FROM public.ecr.aws/lambda/python:3.11
+
+# Install Node.js (needed for MCP GitHub server)
+RUN yum install -y tar gzip && \
+    curl -fsSL https://nodejs.org/dist/v20.11.0/node-v20.11.0-linux-x64.tar.xz -o node.tar.xz && \
+    tar -xf node.tar.xz -C /usr/local --strip-components=1 && \
+    rm node.tar.xz && \
+    node --version && \
+    npm --version
+
+# Install MCP GitHub server globally
+RUN npm install -g @modelcontextprotocol/server-github
+
+# Copy requirements file
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+# Copy application code
+COPY agent.py ${LAMBDA_TASK_ROOT}/
+COPY main.py ${LAMBDA_TASK_ROOT}/
+COPY lambda_handler.py ${LAMBDA_TASK_ROOT}/
+
+# Optional: Copy hybrid agent if you want multi-model support
+COPY hybrid_agent.py ${LAMBDA_TASK_ROOT}/
+
+# Set the Lambda handler
+CMD ["lambda_handler.lambda_handler"]

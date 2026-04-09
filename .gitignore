@@ -49,3 +49,9 @@ htmlcov/
 
 # MCP
 .mcp/
+
+# AWS
+.aws-sam/
+samconfig.toml
+*.zip
+packaged.yaml

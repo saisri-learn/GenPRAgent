@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: GenPRAgent - AI-Powered GitHub PR Generator on AWS Lambda
+
+Globals:
+  Function:
+    Timeout: 300  # 5 minutes (PR creation can take time)
+    MemorySize: 2048  # 2GB RAM (needed for dependencies)
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        GITHUB_PERSONAL_ACCESS_TOKEN: !Ref GitHubToken
+        ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+        OPENAI_API_KEY: !Ref OpenAIApiKey
+        MODEL: !Ref DefaultModel
+        HOST: 0.0.0.0
+        PORT: 8000
+
+Parameters:
+  GitHubToken:
+    Type: String
+    Description: GitHub Personal Access Token
+    NoEcho: true
+
+  AnthropicApiKey:
+    Type: String
+    Description: Anthropic API Key
+    NoEcho: true
+
+  OpenAIApiKey:
+    Type: String
+    Description: OpenAI API Key (optional)
+    Default: ""
+    NoEcho: true
+
+  DefaultModel:
+    Type: String
+    Description: Default AI model to use
+    Default: "claude-sonnet-4-6"
+    AllowedValues:
+      - claude-sonnet-4-6
+      - claude-haiku-4-5-20251001
+      - gpt-4o-mini
+      - gpt-4o
+
+Resources:
+  GenPRAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Events:
+        RootApi:
+          Type: Api
+          Properties:
+            Path: /
+            Method: get
+        HealthApi:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: get
+        CreatePRApi:
+          Type: Api
+          Properties:
+            Path: /create-pr
+            Method: post
+        CreatePRAsyncApi:
+          Type: Api
+          Properties:
+            Path: /create-pr-async
+            Method: post
+    Metadata:
+      DockerTag: v1
+      DockerContext: .
+      Dockerfile: Dockerfile.lambda
+
+Outputs:
+  GenPRAgentApi:
+    Description: "API Gateway endpoint URL for GenPRAgent"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+
+  GenPRAgentFunction:
+    Description: "GenPRAgent Lambda Function ARN"
+    Value: !GetAtt GenPRAgentFunction.Arn
+
+  GenPRAgentFunctionIamRole:
+    Description: "IAM Role for GenPRAgent Lambda Function"
+    Value: !GetAtt GenPRAgentFunctionRole.Arn
